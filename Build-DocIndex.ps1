@@ -1,38 +1,43 @@
 <#
 .SYNOPSIS
-  Build a single self contained HTML index of documents and PDFs.
-  Fast, read only, with favourites and labels saved in the browser.
+  Build a self contained HTML index of documents and PDFs. Fast, read only,
+  with favourites and labels saved in the browser.
 
 .DESCRIPTION
-  Walks a root folder recursively using .NET EnumerateFiles for speed,
-  collects metadata for files matching the given extensions, and writes one
-  HTML file with all data embedded as JSON. The HTML has a search box,
-  type filter, favourites (star) and free text labels per file. Favourites
-  and labels are kept in the browser's localStorage so they survive
-  rescans. The script never writes anything inside the scanned folder.
+  Walks a folder iteratively using a stack and .NET file enumerators.
+  Survives access denied folders, long paths, and big trees without crashing.
+  Writes one HTML file that has a live search box, type filter, favourites
+  (star) and free text labels per file. Favourites and labels live in the
+  browser's localStorage so they persist across rescans.
+
+  The script only reads from the scanned folder. It never writes there.
 
 .PARAMETER Root
   The folder to scan. Defaults to the current directory.
 
 .PARAMETER Output
-  Path to the HTML file to write. Defaults to your Documents folder so
-  nothing is written into the scanned tree.
+  Path to the HTML file to write. Defaults to your Desktop so nothing is
+  written into the scanned tree.
 
 .PARAMETER Extensions
   File extensions to include. Defaults to common doc and pdf types.
 
 .PARAMETER IndexId
   Tag that namespaces favourites and labels in localStorage. Defaults to a
-  hash of the root path so rescans of the same root keep the same data.
+  hash of the root path so rescans of the same root reuse the same data.
+
+.PARAMETER Verbose
+  Show each skipped folder. Off by default to keep output clean.
 
 .EXAMPLE
   .\Build-DocIndex.ps1 -Root "D:\SharedDocs"
 
 .EXAMPLE
-  .\Build-DocIndex.ps1 -Root "\\fileserver\projects" -Output "C:\Users\me\projects.html"
+  powershell -ExecutionPolicy Bypass -File .\Build-DocIndex.ps1 -Root "\\server\share" -Output "C:\Users\me\Desktop\index.html"
 
 .NOTES
   Requires PowerShell 5.1 or later. Read only on the scanned folder.
+  If a folder is denied, the script skips it and continues.
 #>
 
 [CmdletBinding()]
@@ -46,106 +51,287 @@ param(
     [string] $IndexId
 )
 
-$ErrorActionPreference = 'Stop'
+# Do NOT use 'Stop'. We want non terminating errors to be ignored so we can
+# survive access denied folders. We use try/catch only where we deliberately
+# want to handle a failure.
+$ErrorActionPreference = 'Continue'
+
+# ---------- Validate root ----------
 
 if (-not (Test-Path -LiteralPath $Root)) {
-    throw "Root folder not found: $Root"
+    Write-Host "ERROR: Root folder not found: $Root" -ForegroundColor Red
+    exit 1
 }
 
-$rootFull = (Resolve-Path -LiteralPath $Root).Path
+try {
+    $rootFull = (Resolve-Path -LiteralPath $Root -ErrorAction Stop).Path
+} catch {
+    Write-Host "ERROR: Could not resolve path '$Root'. $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+
+# ---------- Decide output path ----------
 
 if (-not $Output) {
-    $docs = [Environment]::GetFolderPath('MyDocuments')
-    $safeName = ($rootFull -replace '[\\:/]', '_').Trim('_')
-    $Output = Join-Path $docs ("doc-index_" + $safeName + ".html")
+    # Desktop is more reliable than Documents (which is often redirected)
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    if (-not $desktop -or -not (Test-Path -LiteralPath $desktop)) {
+        $desktop = $env:USERPROFILE
+    }
+    if (-not $desktop -or -not (Test-Path -LiteralPath $desktop)) {
+        $desktop = (Get-Location).Path
+    }
+
+    # Make a short safe name from the root
+    $rootLeaf = Split-Path -Leaf $rootFull
+    if (-not $rootLeaf) {
+        $rootLeaf = ($rootFull -replace '[\\:/]', '_').Trim('_')
+    }
+    if (-not $rootLeaf) { $rootLeaf = 'root' }
+
+    $Output = Join-Path $desktop ("doc-index_" + $rootLeaf + ".html")
 }
+
+# Ensure output folder exists
+$outputDir = Split-Path -Parent $Output
+if ($outputDir -and -not (Test-Path -LiteralPath $outputDir)) {
+    try {
+        New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+    } catch {
+        Write-Host "ERROR: Could not create output directory '$outputDir'. $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
+}
+
+# ---------- Compute index id ----------
 
 if (-not $IndexId) {
-    $sha = [System.Security.Cryptography.SHA1]::Create()
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($rootFull.ToLowerInvariant())
-    $hash = $sha.ComputeHash($bytes)
-    $IndexId = ([System.BitConverter]::ToString($hash) -replace '-','').Substring(0,12).ToLowerInvariant()
+    try {
+        $sha = [System.Security.Cryptography.SHA1]::Create()
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($rootFull.ToLowerInvariant())
+        $hash = $sha.ComputeHash($bytes)
+        $IndexId = ([System.BitConverter]::ToString($hash) -replace '-','').Substring(0,12).ToLowerInvariant()
+        $sha.Dispose()
+    } catch {
+        # Fallback if crypto unavailable
+        $IndexId = ([Math]::Abs($rootFull.ToLowerInvariant().GetHashCode())).ToString('x')
+    }
 }
 
-Write-Host ("Scanning {0}" -f $rootFull)
-Write-Host "This is read only. Nothing in the scanned folder is changed."
+# ---------- Prepare ----------
+
+Write-Host ("Scanning: {0}" -f $rootFull) -ForegroundColor Cyan
+Write-Host "This is read only. Nothing in the scanned folder will be changed."
+Write-Host ("Output will be written to: {0}" -f $Output)
+Write-Host ""
+
 $start = Get-Date
 
+# Build extension hash set (case insensitive)
 $extSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($e in $Extensions) {
-    $key = $e
+    $key = $e.Trim()
+    if (-not $key) { continue }
     if (-not $key.StartsWith('.')) { $key = '.' + $key }
     [void]$extSet.Add($key)
 }
 
 $records = New-Object 'System.Collections.Generic.List[object]'
-$rootForRel = $rootFull.TrimEnd('\') + '\'
+$rootForRel = $rootFull
+if (-not $rootForRel.EndsWith('\') -and -not $rootForRel.EndsWith('/')) {
+    $rootForRel = $rootForRel + '\'
+}
 
-$script:dirCount = 0
-$script:matched = 0
-$script:skipped = 0
-$script:lastReport = Get-Date
-$script:records = $records
-$script:extSet = $extSet
-$script:rootForRel = $rootForRel
+# ---------- Iterative walker ----------
+# Use a Stack of paths. No recursion, no call depth limits.
+# Each folder is enumerated inside its own try/catch so one bad folder
+# does not stop the whole scan.
 
-function Walk-Folder {
-    param([string] $Path)
-    $script:dirCount++
+$stack = New-Object 'System.Collections.Generic.Stack[string]'
+$stack.Push($rootFull)
+
+$dirCount = 0
+$matched = 0
+$skippedFolders = 0
+$skippedFiles = 0
+$lastReport = Get-Date
+
+while ($stack.Count -gt 0) {
+    $current = $stack.Pop()
+    $dirCount++
+
+    # Enumerate files in this folder
+    $fileEnum = $null
     try {
-        foreach ($file in [System.IO.Directory]::EnumerateFiles($Path)) {
-            try {
-                $ext = [System.IO.Path]::GetExtension($file)
-                if (-not $script:extSet.Contains($ext)) { continue }
-                $info = New-Object System.IO.FileInfo $file
-
-                $rel = $file
-                if ($rel.StartsWith($script:rootForRel, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    $rel = $rel.Substring($script:rootForRel.Length)
-                }
-                $folder = [System.IO.Path]::GetDirectoryName($rel)
-                if (-not $folder) { $folder = '.' }
-
-                $script:records.Add([pscustomobject]@{
-                    n = $info.Name
-                    f = $folder
-                    e = $ext.ToLowerInvariant().TrimStart('.')
-                    s = [int64]$info.Length
-                    m = $info.LastWriteTime.ToString('yyyy-MM-dd HH:mm')
-                    p = $info.FullName
-                })
-                $script:matched++
-
-                $now = Get-Date
-                if (($now - $script:lastReport).TotalSeconds -ge 2) {
-                    Write-Host ("  ... {0} matched, {1} folders scanned" -f $script:matched, $script:dirCount)
-                    $script:lastReport = $now
-                }
-            } catch {
-                $script:skipped++
-            }
-        }
-        foreach ($sub in [System.IO.Directory]::EnumerateDirectories($Path)) {
-            Walk-Folder -Path $sub
-        }
-    } catch [System.UnauthorizedAccessException] {
-        $script:skipped++
-    } catch [System.IO.PathTooLongException] {
-        $script:skipped++
+        $fileEnum = [System.IO.Directory]::EnumerateFiles($current)
     } catch {
-        $script:skipped++
+        $skippedFolders++
+        Write-Verbose ("Skipped (files): {0} - {1}" -f $current, $_.Exception.Message)
+        $fileEnum = $null
+    }
+
+    if ($fileEnum) {
+        # Use a manual enumerator so we can advance past errors
+        $iter = $null
+        try { $iter = $fileEnum.GetEnumerator() } catch { $iter = $null }
+
+        if ($iter) {
+            while ($true) {
+                $hasNext = $false
+                try {
+                    $hasNext = $iter.MoveNext()
+                } catch {
+                    $skippedFiles++
+                    Write-Verbose ("Skipped a file in {0} - {1}" -f $current, $_.Exception.Message)
+                    # Try to keep going
+                    continue
+                }
+                if (-not $hasNext) { break }
+
+                $file = $iter.Current
+                try {
+                    $ext = [System.IO.Path]::GetExtension($file)
+                    if (-not $extSet.Contains($ext)) { continue }
+
+                    $info = New-Object System.IO.FileInfo $file
+
+                    # Build relative folder
+                    $rel = $file
+                    if ($rel.Length -ge $rootForRel.Length -and
+                        $rel.Substring(0, $rootForRel.Length).Equals($rootForRel, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $rel = $rel.Substring($rootForRel.Length)
+                    }
+                    $folder = [System.IO.Path]::GetDirectoryName($rel)
+                    if ([string]::IsNullOrEmpty($folder)) { $folder = '.' }
+
+                    $records.Add([pscustomobject]@{
+                        n = $info.Name
+                        f = $folder
+                        e = $ext.ToLowerInvariant().TrimStart('.')
+                        s = [int64]$info.Length
+                        m = $info.LastWriteTime.ToString('yyyy-MM-dd HH:mm')
+                        p = $info.FullName
+                    })
+                    $matched++
+
+                    # Progress every 2 seconds
+                    $now = Get-Date
+                    if (($now - $lastReport).TotalSeconds -ge 2) {
+                        Write-Host ("  ... {0} matched, {1} folders scanned, {2} skipped" -f $matched, $dirCount, ($skippedFolders + $skippedFiles))
+                        $lastReport = $now
+                    }
+                } catch {
+                    $skippedFiles++
+                }
+            }
+
+            try { $iter.Dispose() } catch { }
+        }
+    }
+
+    # Enumerate subfolders and push onto stack
+    $dirEnum = $null
+    try {
+        $dirEnum = [System.IO.Directory]::EnumerateDirectories($current)
+    } catch {
+        $skippedFolders++
+        Write-Verbose ("Skipped (dirs): {0} - {1}" -f $current, $_.Exception.Message)
+        $dirEnum = $null
+    }
+
+    if ($dirEnum) {
+        $diter = $null
+        try { $diter = $dirEnum.GetEnumerator() } catch { $diter = $null }
+        if ($diter) {
+            while ($true) {
+                $hasNext = $false
+                try { $hasNext = $diter.MoveNext() }
+                catch {
+                    $skippedFolders++
+                    continue
+                }
+                if (-not $hasNext) { break }
+                try { $stack.Push($diter.Current) } catch { $skippedFolders++ }
+            }
+            try { $diter.Dispose() } catch { }
+        }
     }
 }
 
-Walk-Folder -Path $rootFull
-
 $elapsed = (Get-Date) - $start
-Write-Host ("Scanned {0} folders, matched {1} files, skipped {2}, took {3:n1}s" -f `
-    $script:dirCount, $script:matched, $script:skipped, $elapsed.TotalSeconds)
+Write-Host ""
+Write-Host ("Scan complete:")
+Write-Host ("  Folders scanned: {0}" -f $dirCount)
+Write-Host ("  Files matched:   {0}" -f $matched)
+Write-Host ("  Folders skipped: {0}" -f $skippedFolders)
+Write-Host ("  Files skipped:   {0}" -f $skippedFiles)
+Write-Host ("  Time elapsed:    {0:n1} seconds" -f $elapsed.TotalSeconds)
+Write-Host ""
 
-$json = $records | ConvertTo-Json -Depth 4 -Compress
-if (-not $json) { $json = '[]' }
-if (-not $json.StartsWith('[')) { $json = '[' + $json + ']' }
+if ($matched -eq 0) {
+    Write-Host "WARNING: No files matched. The HTML will be empty." -ForegroundColor Yellow
+    Write-Host "Check your extension list and that the root contains matching files."
+}
+
+# ---------- Build JSON ----------
+# Manual StringBuilder for speed and to avoid ConvertTo-Json overhead.
+
+Write-Host "Building HTML..."
+
+function Escape-JsonString {
+    param([string] $s)
+    if ($null -eq $s) { return '""' }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    foreach ($ch in $s.ToCharArray()) {
+        $code = [int]$ch
+        switch ($code) {
+            8  { [void]$sb.Append('\b'); continue }
+            9  { [void]$sb.Append('\t'); continue }
+            10 { [void]$sb.Append('\n'); continue }
+            12 { [void]$sb.Append('\f'); continue }
+            13 { [void]$sb.Append('\r'); continue }
+            34 { [void]$sb.Append('\"'); continue }
+            92 { [void]$sb.Append('\\'); continue }
+            60 { [void]$sb.Append('\u003c'); continue }  # < so </script> cannot break HTML
+            62 { [void]$sb.Append('\u003e'); continue }  # >
+            38 { [void]$sb.Append('\u0026'); continue }  # &
+            default {
+                if ($code -lt 32) {
+                    [void]$sb.AppendFormat('\u{0:x4}', $code)
+                } else {
+                    [void]$sb.Append($ch)
+                }
+            }
+        }
+    }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
+$jsonBuilder = New-Object System.Text.StringBuilder
+[void]$jsonBuilder.Append('[')
+$first = $true
+foreach ($r in $records) {
+    if (-not $first) { [void]$jsonBuilder.Append(',') } else { $first = $false }
+    [void]$jsonBuilder.Append('{"n":')
+    [void]$jsonBuilder.Append((Escape-JsonString $r.n))
+    [void]$jsonBuilder.Append(',"f":')
+    [void]$jsonBuilder.Append((Escape-JsonString $r.f))
+    [void]$jsonBuilder.Append(',"e":')
+    [void]$jsonBuilder.Append((Escape-JsonString $r.e))
+    [void]$jsonBuilder.Append(',"s":')
+    [void]$jsonBuilder.Append($r.s.ToString())
+    [void]$jsonBuilder.Append(',"m":')
+    [void]$jsonBuilder.Append((Escape-JsonString $r.m))
+    [void]$jsonBuilder.Append(',"p":')
+    [void]$jsonBuilder.Append((Escape-JsonString $r.p))
+    [void]$jsonBuilder.Append('}')
+}
+[void]$jsonBuilder.Append(']')
+$json = $jsonBuilder.ToString()
+
+# ---------- HTML template ----------
 
 $html = @'
 <!DOCTYPE html>
@@ -155,13 +341,8 @@ $html = @'
 <title>Document index</title>
 <style>
   :root {
-    --bg: #fafafa;
-    --fg: #222;
-    --muted: #777;
-    --border: #ddd;
-    --row-hover: #eef5ff;
-    --accent: #1a66cc;
-    --star: #f5b301;
+    --bg: #fafafa; --fg: #222; --muted: #777; --border: #ddd;
+    --row-hover: #eef5ff; --accent: #1a66cc; --star: #f5b301;
   }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--fg); font-size: 14px; }
@@ -237,8 +418,8 @@ $html = @'
 </table>
 <div id="empty" class="empty" style="display:none">No files match.</div>
 <script>
-const DATA = {{JSON}};
-const INDEX_ID = '{{INDEX_ID}}';
+const DATA = __JSON_PLACEHOLDER__;
+const INDEX_ID = '__INDEXID_PLACEHOLDER__';
 const STORE_KEY = 'docindex_' + INDEX_ID;
 
 let store = { fav: {}, lbl: {} };
@@ -296,7 +477,7 @@ function fileUrl(p) {
 }
 
 function folderUrl(p) {
-  const idx = p.lastIndexOf('\\');
+  const idx = Math.max(p.lastIndexOf('\\'), p.lastIndexOf('/'));
   const folder = idx >= 0 ? p.substring(0, idx) : p;
   return fileUrl(folder);
 }
@@ -344,7 +525,7 @@ function render() {
     const isFav = !!store.fav[r.p];
     const label = store.lbl[r.p] || '';
     const labelEsc = escapeHtml(label).replace(/"/g, '&quot;');
-    const path = r.p.replace(/"/g, '&quot;');
+    const path = escapeHtml(r.p);
     return '<tr data-path="' + path + '">' +
       '<td class="star ' + (isFav ? 'on' : '') + '" title="Toggle favourite">&#9733;</td>' +
       '<td class="name"><a href="' + url + '">' + highlight(r.n, term) + '</a></td>' +
@@ -440,19 +621,29 @@ render();
 </html>
 '@
 
+# ---------- Substitute placeholders ----------
+# Using non-curly placeholders to avoid any chance of collision with content.
+
 $generated = (Get-Date).ToString('yyyy-MM-dd HH:mm')
 $rootEscaped = $rootFull -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;'
 
-$html = $html.Replace('{{JSON}}', $json)
+$html = $html.Replace('__JSON_PLACEHOLDER__', $json)
+$html = $html.Replace('__INDEXID_PLACEHOLDER__', $IndexId)
 $html = $html.Replace('{{ROOT}}', $rootEscaped)
-$html = $html.Replace('{{COUNT}}', $records.Count.ToString())
+$html = $html.Replace('{{COUNT}}', $matched.ToString())
 $html = $html.Replace('{{GENERATED}}', $generated)
-$html = $html.Replace('{{INDEX_ID}}', $IndexId)
 
-$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-[System.IO.File]::WriteAllText($Output, $html, $utf8NoBom)
+# ---------- Write file ----------
+
+try {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Output, $html, $utf8NoBom)
+} catch {
+    Write-Host ("ERROR: Could not write output file '{0}'. {1}" -f $Output, $_.Exception.Message) -ForegroundColor Red
+    exit 1
+}
 
 Write-Host ""
 Write-Host ("Done. Wrote {0}" -f $Output) -ForegroundColor Green
-Write-Host ("Index id: {0} (favourites and labels are keyed by this)" -f $IndexId)
-Write-Host "Double click the HTML to open in your browser."
+Write-Host ("Index id: {0}" -f $IndexId)
+Write-Host "Double click the HTML file to open it in your browser."
