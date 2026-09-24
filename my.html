@@ -1,33 +1,32 @@
-<!DOCTYPE html>
-<html lang="en-GB">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light">
-<title>Flight Control Computer Functional Model: Software Integration Requirements for AERTEC</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:ital,wght@0,400;0,600;1,400&amp;display=swap">
-<style>
-:root {
-  --paper: #f5f6f4;
-  --ink: #1b1f24;
-  --muted: #5a6068;
-  --rule: #d4d8db;
-  --panel: #ffffff;
-  --accent: #1b4f7a;
-  --id-bg: #e7eaec;
-  --todo: #fbecc4;
-  --target: #eaf1f8;
-}
-*, *::before, *::after { box-sizing: border-box; }
-html { -webkit-text-size-adjust: 100%; }
-body {
-  margin: 0;
-  background: var(--paper);
-  color: var(--ink);
-  font-family: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  font-size: 16px;
-  line-height: 1.6;
-}
-.doc { max-width: 60rem; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+<tr><td><p>ICD and API under version control (<a href="#req-icd-08"><code>ICD.08</code></a>, <a href="#req-hal-06"><code>HAL.06</code></a>)</p></td><td><p>Interface changes are already traceable.</p></td></tr>
+<tr><td><p>Contract option for BSP source access or escrow in a later phase</p></td><td><p>Certification will need full lifecycle data for software below the application; an option now avoids renegotiating later.</p></td></tr>
+</table>
+</div>
+<h2 id="sec-14">14. Open points for AALTO before issue</h2>
+<p>Eight points need closing inside AALTO before this goes to AERTEC; the first two decide the most.</p>
+<div class="table-wrap">
+<table class="open">
+<tr><th>Open point</th><th>What closes it</th><th>Affects</th></tr>
+<tr><td><p>Abstraction layer path, A or B</p></td><td><p>Check whether our existing software concentrates hardware access behind a defined layer or spreads it across the code. SciTools Understand can trace every call that touches hardware.</p></td><td><p><a href="#sec-7">Section 7</a></p></td></tr>
+<tr><td><p>Existing interface specification for the slave equipment</p></td><td><p>Confirm a written specification exists and add its reference. If none exists, producing one becomes a prerequisite for <a href="#req-icd-01"><code>ICD.01</code></a>.</p></td><td><p><a href="#sec-8">Section 8</a></p></td></tr>
+<tr><td><p>Sharing interface headers under Path B</p></td><td><p>Confirm we are comfortable giving AERTEC our abstraction layer headers, which are interface definitions rather than application source.</p></td><td><p><a href="#req-hal-07"><code>HAL.07</code></a></p></td></tr>
+<tr><td><p>Processor choice</p></td><td><p>Decide whether to require the same processor family and endianness as our current flight computer, which keeps porting effort down.</p></td><td><p><a href="#req-tc-02"><code>TC.02</code></a></p></td></tr>
+<tr><td><p>Placeholders</p></td><td><p>Fill in the RTOS or bare metal choice, C language standard, bus type, document references and demonstration duration.</p></td><td><p><a href="#req-bsp-02"><code>BSP.02</code></a>, <a href="#req-tc-05"><code>TC.05</code></a>, <a href="#req-icd-02"><code>ICD.02</code></a>, <a href="#req-acc-03"><code>ACC.03</code></a></p></td></tr>
+<tr><td><p>Number of development units</p></td><td><p>Confirm the count in <a href="#req-lrd-06"><code>LRD.06</code></a>.</p></td><td><p><a href="#sec-10">Section 10</a></p></td></tr>
+<tr><td><p>Binary only integration</p></td><td><p>Confirm we will supply compiled binaries where AERTEC needs our software for joint integration or demonstration.</p></td><td><p><a href="#sec-2">Section 2</a></p></td></tr>
+<tr><td><p>Switchover demonstration</p></td><td><p>Agree how the active unit is failed in <a href="#req-acc-04"><code>ACC.04</code></a>.</p></td><td><p><a href="#sec-12">Section 12</a></p></td></tr>
+</table>
+</div>
+<h2 id="sec-15">15. Glossary</h2>
+<p><strong>Active/backup.</strong> Two computers running together, one in control and one ready to take over if it fails.</p>
+<p><strong>BSP.</strong> Board support package: the startup code, drivers and initialisation that make a bare board usable by application software.</p>
+<p><strong>CCDL.</strong> Cross channel data link: the cross data link in AERTEC's scope that lets the active and backup units share state and health.</p>
+<p><strong>HAL.</strong> Hardware abstraction layer: the documented set of functions through which application software reaches the hardware.</p>
+<p><strong>ICD.</strong> Interface control document: the definitive description of an interface, from physical layer to message formats and timing.</p>
+<p><strong>JTAG and SWD.</strong> Standard debug ports that let a debugger control the processor, set breakpoints and inspect memory.</p>
+<p><strong>Linker script.</strong> The file that tells the linker where code and data are placed in memory.</p>
+<p><strong>Memory map.</strong> The layout of all addressable memory and memory mapped devices on the board.</p>
+<p><strong>Toolchain.</strong> The compiler, assembler, linker and libraries that turn source code into a binary for the target processor.</p>
+</main>
+</body>
+</html>
